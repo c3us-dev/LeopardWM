@@ -419,47 +419,87 @@ fn restore_maximized_window_with(
     report: impl FnOnce(crate::WindowEvent),
 ) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        IsWindowVisible, IsZoomed, ShowWindow, SW_SHOWNOACTIVATE,
+        IsWindowVisible, IsZoomed, ShowWindow, ShowWindowAsync, SW_SHOWNOACTIVATE,
     };
 
     let hwnd = HWND(hwnd_value as *mut c_void);
     let Some(managed_lifetime_token) = identity.managed_lifetime_token else {
         return;
     };
-    if !window_identity_matches(hwnd, identity) || !unsafe { IsWindowVisible(hwnd).as_bool() } {
+    let is_zoomed = || unsafe { IsZoomed(hwnd).as_bool() };
+    let is_admission_target =
+        || window_identity_matches(hwnd, identity) && unsafe { IsWindowVisible(hwnd).as_bool() };
+    if !is_admission_target() {
         report(crate::WindowEvent::MaximizedAdmissionRestored {
             window_id,
             managed_lifetime_token,
-            still_maximized: unsafe { !IsWindow(Some(hwnd)).as_bool() || IsZoomed(hwnd).as_bool() },
+            still_maximized: unsafe { !IsWindow(Some(hwnd)).as_bool() } || is_zoomed(),
         });
         return;
     }
-    let result = unsafe {
-        crate::focus::restore_maximized_window_no_activate_with(
-            window_id,
-            || IsWindow(Some(hwnd)).as_bool(),
-            || IsZoomed(hwnd).as_bool(),
-            || {
-                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            },
-        )
-    };
-    let still_maximized = match result {
-        Ok(()) => false,
-        Err(error) => {
-            tracing::debug!(
-                "Could not restore maximized window {} without activation: {:?}",
-                window_id,
-                error
-            );
-            unsafe { IsZoomed(hwnd).as_bool() }
-        }
-    };
+    let result = crate::focus::restore_maximized_window_no_activate_with(
+        window_id,
+        is_admission_target,
+        is_zoomed,
+        || unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        },
+        || unsafe {
+            let _ = ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
+        },
+        |ms| std::thread::sleep(std::time::Duration::from_millis(ms as u64)),
+    );
+    let still_maximized = maximized_admission_still_maximized(result, || {
+        report_target_still_zoomed(&is_admission_target, &is_zoomed)
+    });
     report(crate::WindowEvent::MaximizedAdmissionRestored {
         window_id,
         managed_lifetime_token,
         still_maximized,
     });
+}
+
+/// The zoom reading a restore failure reports. A target that is no longer
+/// available cannot be read as a restored window: the handle may now name a
+/// replacement, or none at all, so report the conservative outcome instead.
+fn report_target_still_zoomed(
+    is_admission_target: &impl Fn() -> bool,
+    is_zoomed: &impl Fn() -> bool,
+) -> bool {
+    if !is_admission_target() {
+        return true;
+    }
+    is_zoomed()
+}
+
+/// Decide the `still_maximized` value a restore outcome reports. `target_still_zoomed`
+/// supplies the live zoom reading and is only consulted for a target that is
+/// still confirmed present, so a stale handle can never be read as a restored
+/// window.
+fn maximized_admission_still_maximized(
+    result: Result<(), Win32Error>,
+    target_still_zoomed: impl FnOnce() -> bool,
+) -> bool {
+    match result {
+        Ok(()) => false,
+        Err(Win32Error::WindowNotFound(_)) => {
+            // The window is gone or replaced, so its handle proves nothing
+            // about zoom state. Report the conservative outcome: a restore
+            // that cannot be confirmed leaves the window's placement
+            // suppressed rather than tiling a window that may be maximized.
+            tracing::debug!(
+                "Maximized admission target is no longer available; reporting it unrestored"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::debug!(
+                "Could not restore a maximized window without activation: {:?}",
+                error
+            );
+            target_still_zoomed()
+        }
+    }
 }
 
 fn apply_window_style(
@@ -816,6 +856,63 @@ pub fn restore_maximizebox_panic_recovery() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_target_is_reported_as_not_restored() {
+        let reads = std::cell::Cell::new(0);
+        let still_maximized =
+            maximized_admission_still_maximized(Err(Win32Error::WindowNotFound(42)), || {
+                reads.set(reads.get() + 1);
+                false
+            });
+
+        assert!(
+            still_maximized,
+            "an unconfirmable restore must not look restored"
+        );
+        assert_eq!(reads.get(), 0, "the stale handle must not be inspected");
+    }
+
+    #[test]
+    fn timed_out_restore_reports_a_target_that_vanished_before_reporting() {
+        // The restore timed out, then the window was destroyed, replaced or
+        // hidden before the completion event was built.
+        let available = std::cell::Cell::new(false);
+        let zoom_reads = std::cell::Cell::new(0);
+        let is_admission_target = || available.get();
+        let is_zoomed = || {
+            zoom_reads.set(zoom_reads.get() + 1);
+            false
+        };
+
+        let still_maximized = maximized_admission_still_maximized(
+            Err(Win32Error::SetPositionFailed("timed out".to_string())),
+            || report_target_still_zoomed(&is_admission_target, &is_zoomed),
+        );
+
+        assert!(still_maximized, "a vanished target must not look restored");
+        assert_eq!(zoom_reads.get(), 0, "the stale handle must not be read");
+    }
+
+    #[test]
+    fn failed_restore_reports_a_live_target_that_is_still_zoomed() {
+        let result = Err(Win32Error::SetPositionFailed("ignored".to_string()));
+        assert!(maximized_admission_still_maximized(result, || true));
+        assert!(!maximized_admission_still_maximized(
+            Err(Win32Error::SetPositionFailed("ignored".to_string())),
+            || false
+        ));
+    }
+
+    #[test]
+    fn successful_restore_reports_the_window_as_not_maximized() {
+        let reads = std::cell::Cell::new(0);
+        assert!(!maximized_admission_still_maximized(Ok(()), || {
+            reads.set(reads.get() + 1);
+            true
+        }));
+        assert_eq!(reads.get(), 0);
+    }
 
     #[test]
     fn test_is_border_color_unsupported_hresult_mapping() {

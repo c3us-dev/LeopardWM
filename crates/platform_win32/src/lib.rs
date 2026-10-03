@@ -71,12 +71,12 @@ pub use focus::{
 pub use placement::apply_cloak_state;
 pub use placement::clear_suspected_oversize;
 pub use placement::{
-    apply_placements, clear_inset_cache, drain_ghost_cloaked, dwm_cloak_window, dwm_uncloak_all,
-    dwm_uncloak_window, get_window_frame_insets, get_window_invisible_insets,
-    get_window_style_bits, is_placement_cloaked, is_placement_parked, mark_ghost_cloaked,
-    park_window_for_placement, set_dwm_transitions_disabled, unmark_ghost_cloaked,
-    visible_rect_to_frame_rect, ApplyPlacementsResult, HeightViolation, PlacementCache,
-    PlacementLanding, WidthViolation,
+    apply_display_change_placements, apply_placements, clear_inset_cache, drain_ghost_cloaked,
+    dwm_cloak_window, dwm_uncloak_all, dwm_uncloak_window, get_window_frame_insets,
+    get_window_invisible_insets, get_window_style_bits, is_placement_cloaked, is_placement_parked,
+    mark_ghost_cloaked, park_window_for_placement, set_dwm_transitions_disabled,
+    unmark_ghost_cloaked, visible_rect_to_frame_rect, ApplyPlacementsResult, HeightViolation,
+    PlacementCache, PlacementLanding, WidthViolation,
 };
 pub use system::{
     are_animations_enabled, get_system_highlight_color_bgr, is_high_contrast_enabled,
@@ -86,8 +86,9 @@ pub use types::{MonitorId, MonitorInfo, PlatformConfig, Win32Error, WindowInfo};
 pub use visibility::{
     cascade_windows, emergency_restore_windows, is_move_offscreen_sentinel_position,
     is_move_offscreen_sentinel_rect, move_window_offscreen, position_window,
-    restore_all_windows_moved_offscreen_best_effort, restore_window_moved_offscreen,
-    restore_windows_moved_offscreen, uncloak_all_managed_windows, uncloak_all_visible_windows,
+    queue_window_offscreen, restore_all_windows_moved_offscreen_best_effort,
+    restore_window_moved_offscreen, restore_windows_moved_offscreen, uncloak_all_managed_windows,
+    uncloak_all_visible_windows,
 };
 pub use window_identity::{
     clear_window_lifetime_token, read_managed_lifetime_token, read_window_lifetime_token,

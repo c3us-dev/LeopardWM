@@ -4,6 +4,32 @@ use std::sync::atomic::Ordering;
 
 static REAL_WINDOW_STYLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+// Run the test binary with the daemon's process DPI awareness, set before any test thread or
+// window exists, so placements and DWM frame measurements agree on scaled displays.
+#[used]
+#[link_section = ".CRT$XCU"]
+static TEST_PROCESS_DPI_AWARENESS: extern "C" fn() = {
+    extern "C" fn set_test_process_dpi_awareness() {
+        leopardwm_platform_win32::set_dpi_awareness();
+    }
+    set_test_process_dpi_awareness
+};
+
+#[test]
+fn test_threads_inherit_per_monitor_dpi_awareness() {
+    use windows::Win32::UI::HiDpi::{
+        AreDpiAwarenessContextsEqual, GetThreadDpiAwarenessContext,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    assert!(unsafe {
+        AreDpiAwarenessContextsEqual(
+            GetThreadDpiAwarenessContext(),
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        )
+        .as_bool()
+    });
+}
+
 fn pump_window_style_worker_until_idle() {
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
@@ -13927,7 +13953,7 @@ fn test_cmd_health_check() {
         std::process::id()
     ));
     std::fs::write(&blocked_path, b"not a directory").unwrap();
-    let (_, log_health) = crate::daemon_log::open(&blocked_path);
+    let (_, log_health) = crate::daemon_log::open(&blocked_path, tracing::Level::INFO);
     std::fs::remove_file(&blocked_path).unwrap();
     state.daemon_log = Some(log_health);
     let resp = state.handle_command(IpcCommand::HealthCheck);
@@ -17638,3 +17664,6 @@ mod maximized_admission_tests;
 
 #[path = "maximized_admission_regression.rs"]
 mod maximized_admission_regression;
+
+#[path = "display_change_regression.rs"]
+mod display_change_regression;

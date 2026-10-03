@@ -9,6 +9,7 @@ use leopardwm_ipc::{
     NativeSwipeStatus,
 };
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -67,11 +68,46 @@ pub(crate) fn daemon_log_path(
     }
 }
 
+/// The `behavior.log_level` in the config file and what it writes. A missing
+/// file, missing key, or unrecognized value means info, as in daemon startup.
+/// The daemon applies the level only at startup, so this is the configured
+/// level, not necessarily the running daemon's. A file that exists but cannot
+/// be read is unknown, because the daemon may be able to read it.
+pub(crate) fn configured_log_level(config: Option<(PathBuf, io::Result<String>)>) -> String {
+    const LEVELS: [(&str, &str); 5] = [
+        ("trace", "everything is written"),
+        ("debug", "debug, info, warnings and errors are written"),
+        ("info", "info, warnings and errors are written"),
+        ("warn", "only warnings and errors are written"),
+        ("error", "only errors are written"),
+    ];
+    let text = match config {
+        Some((path, Err(error))) => {
+            return format!("unknown (could not read {}: {error})", path.display());
+        }
+        Some((_, Ok(text))) => Some(text),
+        None => None,
+    };
+    let configured = text
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|table| {
+            let level = table.get("behavior")?.get("log_level")?.as_str()?;
+            LEVELS
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(level))
+        });
+    match configured {
+        Some((name, writes)) => format!("{name} ({writes})"),
+        None => "info (default; no recognized behavior.log_level in the config file)".to_string(),
+    }
+}
+
 pub(crate) fn daemon_log_check(
     status: Option<&DaemonLogStatus>,
     modified: Option<SystemTime>,
     now: SystemTime,
     uptime_seconds: Option<u64>,
+    log_level: &str,
 ) -> CheckResult {
     match status {
         Some(DaemonLogStatus::OpenFailed { path, error }) => {
@@ -99,7 +135,9 @@ pub(crate) fn daemon_log_check(
                 let message = format!("Daemon log: writing {path}; file modified time unavailable");
                 CheckResult::Warn(message)
             } else {
-                CheckResult::Pass(format!("Daemon log: writing {path}"))
+                CheckResult::Pass(format!(
+                    "Daemon log: writing {path}; configured log level: {log_level}"
+                ))
             }
         }
         Some(DaemonLogStatus::Unknown) => {
@@ -124,7 +162,18 @@ fn print_daemon_log_check(status: Option<&DaemonLogStatus>, uptime_seconds: Opti
     let modified = fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok();
-    daemon_log_check(status, modified, SystemTime::now(), uptime_seconds).print();
+    let config = doctor_config_path().0.map(|path| {
+        let text = fs::read_to_string(&path);
+        (path, text)
+    });
+    daemon_log_check(
+        status,
+        modified,
+        SystemTime::now(),
+        uptime_seconds,
+        &configured_log_level(config),
+    )
+    .print();
 }
 
 impl CheckResult {

@@ -7,15 +7,16 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 use windows::core::BOOL;
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmFlush, DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS,
     DWMWINDOWATTRIBUTE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetClassNameW, GetWindowRect, IsIconic,
-    IsWindow, IsZoomed, SetWindowPos, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetClassNameW, GetWindowRect,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsZoomed, SendMessageTimeoutW, SetWindowPos,
+    SET_WINDOW_POS_FLAGS, SMTO_ABORTIFHUNG, SMTO_BLOCK, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, WM_NULL,
 };
 
 /// Undocumented but well-known DWM attribute for cloaking windows.
@@ -510,6 +511,7 @@ pub fn apply_placements(
     post_animation_landing: bool,
 ) -> Result<ApplyPlacementsResult, Win32Error> {
     let mut queued_endpoints = HashMap::new();
+    let owner_deferrals = probe_placement_owners(placements, false, cache.is_none());
     apply_placements_inner(
         placements,
         config,
@@ -517,7 +519,27 @@ pub fn apply_placements(
         post_animation_landing,
         true,
         &mut queued_endpoints,
+        &owner_deferrals,
     )
+}
+
+pub fn apply_display_change_placements(
+    placements: &[WindowPlacement],
+    config: &PlatformConfig,
+    post_animation_landing: bool,
+) -> Result<(ApplyPlacementsResult, HashSet<WindowId>), Win32Error> {
+    let mut queued_endpoints = HashMap::new();
+    let owner_deferrals = probe_placement_owners(placements, true, true);
+    apply_placements_inner(
+        placements,
+        config,
+        &mut None,
+        post_animation_landing,
+        true,
+        &mut queued_endpoints,
+        &owner_deferrals,
+    )
+    .map(|result| (result, owner_deferrals.unresponsive))
 }
 
 fn apply_placements_inner(
@@ -527,6 +549,7 @@ fn apply_placements_inner(
     post_animation_landing: bool,
     allow_landing_measurement_retry: bool,
     queued_endpoints: &mut HashMap<WindowId, (i32, i32, i32, i32)>,
+    owner_deferrals: &OwnerDeferrals,
 ) -> Result<ApplyPlacementsResult, Win32Error> {
     let empty_result = ApplyPlacementsResult::default();
     if placements.is_empty() {
@@ -574,11 +597,13 @@ fn apply_placements_inner(
         async_flag,
         high_contrast,
         force_positioning,
+        owner_deferrals,
     );
     // Uncloak before positioning so DWM composites returning windows at their
     // new rect before the landing measurement. The retry can repeat this safely.
     uncloak_becoming_visible(&entries);
-    let pending_window_ids = pending_async_entries(&entries);
+    let mut pending_window_ids = pending_async_entries(&entries);
+    pending_window_ids.extend(owner_deferrals.pending.iter().copied());
     let (applied, mut failed_window_ids) = position_entries_for_pending(
         &entries,
         cache.is_none() && post_animation_landing,
@@ -586,6 +611,17 @@ fn apply_placements_inner(
         queued_endpoints,
     );
     failed_window_ids.extend(failed_recovery_window_ids.iter().copied());
+    let mut guard = lock_async_positions();
+    if let Some(submissions) = guard.as_mut() {
+        for window_id in &owner_deferrals.wait_for_owner {
+            if !failed_window_ids.contains(window_id) {
+                if let Some(submission) = submissions.get_mut(window_id) {
+                    submission.wait_for_owner = true;
+                }
+            }
+        }
+    }
+    drop(guard);
 
     // On the synchronous landing pass, compare the DWM visible measurement to
     // both the layout request and the expanded SetWindowPos frame request. A
@@ -620,6 +656,7 @@ fn apply_placements_inner(
             post_animation_landing,
             false,
             queued_endpoints,
+            owner_deferrals,
         );
     }
 
@@ -858,6 +895,7 @@ fn skip_visible_tiled_maximized(
     is_zoomed: bool,
     cache: Option<&mut PlacementCache>,
     async_flag: SET_WINDOW_POS_FLAGS,
+    owner_pending: bool,
     async_recovery: &mut bool,
     failed_recovery: &mut bool,
 ) -> bool {
@@ -874,9 +912,10 @@ fn skip_visible_tiled_maximized(
         // the layout. Return a placement-parked maximized HWND before
         // releasing that cloak. SWP_NOSIZE deliberately preserves maximized
         // dimensions and does not restore ordinary visible maximized windows.
-        let pending = async_flag == SET_WINDOW_POS_FLAGS(0)
-            && is_placement_parked(placement.window_id)
-            && pending_async_position(placement.window_id);
+        let pending = is_placement_parked(placement.window_id)
+            && (owner_pending
+                || (async_flag == SET_WINDOW_POS_FLAGS(0)
+                    && pending_async_position(placement.window_id)));
         let recovery =
             recover_placement_parked(placement.window_id, async_flag, pending, |flags| {
                 let Ok(hwnd) = window_id_to_hwnd(placement.window_id) else {
@@ -891,6 +930,15 @@ fn skip_visible_tiled_maximized(
         *failed_recovery = recovery == ParkedRecoveryOutcome::Failed;
         if *async_recovery {
             record_queued_recovery(placement.window_id, placement.rect.x, placement.rect.y);
+            if owner_pending {
+                record_async_coordinates(
+                    placement.window_id,
+                    placement.rect.x,
+                    placement.rect.y,
+                    None,
+                    false,
+                );
+            }
         }
     }
     skip
@@ -903,6 +951,7 @@ fn build_defer_entries(
     async_flag: SET_WINDOW_POS_FLAGS,
     high_contrast: bool,
     force_positioning: bool,
+    owner_deferrals: &OwnerDeferrals,
 ) -> (
     Vec<DeferEntry>,
     u32,
@@ -933,6 +982,7 @@ fn build_defer_entries(
             is_zoomed,
             cache.as_deref_mut(),
             async_flag,
+            owner_deferrals.pending.contains(&placement.window_id),
             &mut async_recovery,
             &mut failed_recovery,
         ) {
@@ -1058,6 +1108,107 @@ fn uncloak_becoming_visible(entries: &[DeferEntry]) {
     }
 }
 
+#[derive(Default)]
+struct OwnerDeferrals {
+    pending: HashSet<WindowId>,
+    wait_for_owner: HashSet<WindowId>,
+    unresponsive: HashSet<WindowId>,
+}
+
+fn probe_placement_owners(
+    placements: &[WindowPlacement],
+    display_change: bool,
+    probe_marked: bool,
+) -> OwnerDeferrals {
+    let marked: HashSet<_> = lock_async_positions()
+        .as_ref()
+        .map(|submissions| {
+            submissions
+                .iter()
+                .filter_map(|(&window_id, submission)| {
+                    submission.wait_for_owner.then_some(window_id)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut deferrals = OwnerDeferrals::default();
+    let mut owner_answers = HashMap::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let placed: HashSet<_> = placements
+        .iter()
+        .map(|placement| placement.window_id)
+        .collect();
+    let omitted = marked
+        .iter()
+        .copied()
+        .filter(|window_id| probe_marked && !placed.contains(window_id));
+    for window_id in placements
+        .iter()
+        .map(|placement| placement.window_id)
+        .chain(omitted)
+    {
+        let was_marked = marked.contains(&window_id);
+        if !display_change && !was_marked {
+            continue;
+        }
+        if was_marked {
+            deferrals.pending.insert(window_id);
+        }
+        if !probe_marked {
+            continue;
+        }
+        let Ok(hwnd) = window_id_to_hwnd(window_id) else {
+            continue;
+        };
+        if unsafe { !IsWindow(Some(hwnd)).as_bool() } {
+            clear_async_position(window_id);
+            deferrals.pending.remove(&window_id);
+            continue;
+        }
+        if unsafe { IsIconic(hwnd).as_bool() } {
+            continue;
+        }
+        let owner_thread = unsafe { GetWindowThreadProcessId(hwnd, None) };
+        let answered = *owner_answers.entry(owner_thread).or_insert_with(|| {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let timeout_ms = remaining.as_millis().min(100) as u32;
+            if timeout_ms == 0 {
+                return None;
+            }
+            Some(unsafe {
+                SendMessageTimeoutW(
+                    hwnd,
+                    WM_NULL,
+                    WPARAM(0),
+                    LPARAM(0),
+                    SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                    timeout_ms,
+                    None,
+                )
+                .0 != 0
+            })
+        });
+        if answered == Some(true) {
+            if was_marked {
+                if let Some(submission) = lock_async_positions()
+                    .as_mut()
+                    .and_then(|submissions| submissions.get_mut(&window_id))
+                {
+                    submission.wait_for_owner = false;
+                    submission.first_submitted = std::time::Instant::now();
+                }
+            }
+        } else {
+            deferrals.pending.insert(window_id);
+            deferrals.wait_for_owner.insert(window_id);
+            if answered == Some(false) {
+                deferrals.unresponsive.insert(window_id);
+            }
+        }
+    }
+    deferrals
+}
+
 /// Position all entries in one DeferWindowPos batch; returns (applied, failed ids).
 #[cfg(test)]
 fn position_entries(entries: &[DeferEntry], post_animation_landing: bool) -> (u32, HashSet<u64>) {
@@ -1180,9 +1331,7 @@ fn pending_async_entries(entries: &[DeferEntry]) -> HashSet<WindowId> {
         let Some(previous) = submissions.get(&entry.window_id).copied() else {
             continue;
         };
-        let mut rect = RECT::default();
-        let current =
-            unsafe { GetWindowRect(entry.hwnd, &mut rect).ok() }.map(|_| (rect.left, rect.top));
+        let current = observed_async_position(entry.hwnd);
         match async_position_state(previous, current, now) {
             AsyncPositionState::Drained => {
                 submissions.remove(&entry.window_id);
@@ -1196,15 +1345,44 @@ fn pending_async_entries(entries: &[DeferEntry]) -> HashSet<WindowId> {
     pending
 }
 
-fn record_async_position(entry: &DeferEntry) {
-    record_async_coordinates(entry.window_id, entry.x, entry.y);
+fn observed_async_position(hwnd: HWND) -> Option<(i32, i32)> {
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut rect).ok()? };
+    Some((rect.left, rect.top))
 }
 
-fn record_async_coordinates(window_id: WindowId, x: i32, y: i32) {
+fn record_async_position(entry: &DeferEntry) {
+    let size = (!entry.flags.contains(SWP_NOSIZE)).then_some((entry.w, entry.h));
+    record_async_coordinates(entry.window_id, entry.x, entry.y, size, false);
+}
+
+pub(crate) fn record_queued_owner_position(window_id: WindowId, x: i32, y: i32) {
+    record_async_coordinates(window_id, x, y, None, true);
+}
+
+pub(crate) fn record_queued_owner_rect(window_id: WindowId, rect: &Rect) {
+    record_async_coordinates(
+        window_id,
+        rect.x,
+        rect.y,
+        Some((rect.width, rect.height)),
+        true,
+    );
+}
+
+fn record_async_coordinates(
+    window_id: WindowId,
+    x: i32,
+    y: i32,
+    size: Option<(i32, i32)>,
+    wait_for_owner: bool,
+) {
     let now = std::time::Instant::now();
     let mut guard = lock_async_positions();
     let submissions = guard.get_or_insert_with(HashMap::new);
-    let next = async_position_submission(submissions.get(&window_id).copied(), (x, y), now);
+    let mut next = async_position_submission(submissions.get(&window_id).copied(), (x, y), now);
+    next.size = size.or(next.size);
+    next.wait_for_owner |= wait_for_owner;
     submissions.insert(window_id, next);
 }
 
@@ -1218,11 +1396,15 @@ fn async_position_submission(
             x: position.0,
             y: position.1,
             first_submitted: previous.first_submitted,
+            size: previous.size,
+            wait_for_owner: previous.wait_for_owner,
         },
         None => AsyncPositionSubmission {
             x: position.0,
             y: position.1,
             first_submitted: now,
+            size: None,
+            wait_for_owner: false,
         },
     }
 }
@@ -1239,7 +1421,9 @@ fn async_position_state(
     current_position: Option<(i32, i32)>,
     now: std::time::Instant,
 ) -> AsyncPositionState {
-    if current_position == Some((submission.x, submission.y)) {
+    if submission.wait_for_owner {
+        AsyncPositionState::Pending
+    } else if current_position == Some((submission.x, submission.y)) {
         AsyncPositionState::Drained
     } else if now.saturating_duration_since(submission.first_submitted)
         < ASYNC_POSITION_PENDING_LIMIT
@@ -1259,10 +1443,9 @@ fn pending_async_position(window_id: WindowId) -> bool {
     let Some(submission) = submissions.get(&window_id).copied() else {
         return false;
     };
-    let current = window_id_to_hwnd(window_id).ok().and_then(|hwnd| {
-        let mut rect = RECT::default();
-        unsafe { GetWindowRect(hwnd, &mut rect).ok() }.map(|_| (rect.left, rect.top))
-    });
+    let current = window_id_to_hwnd(window_id)
+        .ok()
+        .and_then(observed_async_position);
     match async_position_state(submission, current, now) {
         AsyncPositionState::Drained => {
             submissions.remove(&window_id);
@@ -1271,6 +1454,18 @@ fn pending_async_position(window_id: WindowId) -> bool {
         AsyncPositionState::Pending => true,
         AsyncPositionState::Expired => false,
     }
+}
+
+pub(crate) fn owner_wait_target(window_id: WindowId, current: &Rect) -> Option<Rect> {
+    let submission = lock_async_positions()
+        .as_ref()
+        .and_then(|submissions| submissions.get(&window_id))
+        .copied()?;
+    if !submission.wait_for_owner {
+        return None;
+    }
+    let (width, height) = submission.size.unwrap_or((current.width, current.height));
+    Some(Rect::new(submission.x, submission.y, width, height))
 }
 
 fn clear_async_position(window_id: WindowId) {
@@ -1381,7 +1576,10 @@ type SuspectedSizes = (Option<i32>, Option<i32>);
 struct AsyncPositionSubmission {
     x: i32,
     y: i32,
+    size: Option<(i32, i32)>,
     first_submitted: std::time::Instant,
+    // Display-change deferrals must not expire into a synchronous call while the owner is hung.
+    wait_for_owner: bool,
 }
 
 // Expire pending work so windows that clamp or reject placement resume normal handling.
@@ -1403,6 +1601,8 @@ fn record_queued_recovery(window_id: WindowId, x: i32, y: i32) {
         x,
         y,
         first_submitted: std::time::Instant::now(),
+        size: None,
+        wait_for_owner: false,
     };
     lock_queued_recoveries()
         .get_or_insert_with(HashMap::new)
@@ -2217,6 +2417,8 @@ mod tests {
             x: position.0,
             y: position.1,
             first_submitted: submitted,
+            size: None,
+            wait_for_owner: false,
         };
         assert_eq!(
             async_position_state(submission, Some(position), recent),
@@ -2245,6 +2447,8 @@ mod tests {
                 x: position.0,
                 y: position.1,
                 first_submitted: submitted,
+                size: None,
+                wait_for_owner: false,
             }),
             updated_position,
             recent,
@@ -2280,6 +2484,8 @@ mod tests {
                 x: destination.0,
                 y: destination.1,
                 first_submitted: submission_time,
+                size: None,
+                wait_for_owner: false,
             },
         )]);
 
@@ -2326,6 +2532,8 @@ mod tests {
                 x: destination.0,
                 y: destination.1,
                 first_submitted: expired_submission_time,
+                size: None,
+                wait_for_owner: false,
             },
         );
         let landings = collect_placement_landings_with_recoveries(
@@ -3783,6 +3991,7 @@ mod tests {
             true,
             Some(&mut cache),
             SET_WINDOW_POS_FLAGS(0),
+            false,
             &mut async_recovery,
             &mut failed_recovery,
         ));
@@ -3831,6 +4040,7 @@ mod tests {
             false,
             Some(&mut cache),
             SET_WINDOW_POS_FLAGS(0),
+            false,
             &mut async_recovery,
             &mut failed_recovery,
         ));
@@ -3843,6 +4053,7 @@ mod tests {
             true,
             None,
             SET_WINDOW_POS_FLAGS(0),
+            false,
             &mut async_recovery,
             &mut failed_recovery,
         ));
@@ -3856,6 +4067,7 @@ mod tests {
             true,
             Some(&mut cache),
             SET_WINDOW_POS_FLAGS(0),
+            false,
             &mut async_recovery,
             &mut failed_recovery,
         ));
@@ -4018,6 +4230,7 @@ mod tests {
             SET_WINDOW_POS_FLAGS(0),
             high_contrast,
             true,
+            &OwnerDeferrals::default(),
         );
         assert_eq!(skipped, 0);
         let entry = entries

@@ -45,6 +45,41 @@ fn bounded_timeout_diagnostic(value: String) -> Option<String> {
     Some(bounded)
 }
 
+fn collect_layout_apply_candidates(
+    window_ids: &[u64],
+    lookup_window_info: impl Fn(u64) -> Option<leopardwm_platform_win32::WindowInfo>,
+) -> Vec<LayoutApplyTimeoutCandidate> {
+    let mut executable_by_pid: HashMap<u32, Option<String>> = HashMap::new();
+
+    window_ids
+        .iter()
+        .map(|&hwnd| {
+            let Some(info) = lookup_window_info(hwnd) else {
+                return LayoutApplyTimeoutCandidate {
+                    hwnd,
+                    class_name: None,
+                    title: None,
+                    executable: None,
+                };
+            };
+            let executable = executable_by_pid
+                .entry(info.process_id)
+                .or_insert_with(|| {
+                    leopardwm_platform_win32::get_process_executable(info.process_id)
+                })
+                .clone()
+                .and_then(bounded_timeout_diagnostic);
+
+            LayoutApplyTimeoutCandidate {
+                hwnd,
+                class_name: bounded_timeout_diagnostic(info.class_name),
+                title: bounded_timeout_diagnostic(info.title),
+                executable,
+            }
+        })
+        .collect()
+}
+
 fn run_layout_apply_recovery_pass(window_ids: &[u64], context: &str) {
     #[cfg(not(test))]
     run_visibility_recovery_pass(window_ids, context);
@@ -495,35 +530,7 @@ impl AppState {
         &self,
         window_ids: &[u64],
     ) -> Vec<LayoutApplyTimeoutCandidate> {
-        let mut executable_by_pid: HashMap<u32, Option<String>> = HashMap::new();
-
-        window_ids
-            .iter()
-            .map(|&hwnd| {
-                let Some(info) = self.lookup_window_info(hwnd) else {
-                    return LayoutApplyTimeoutCandidate {
-                        hwnd,
-                        class_name: None,
-                        title: None,
-                        executable: None,
-                    };
-                };
-                let executable = executable_by_pid
-                    .entry(info.process_id)
-                    .or_insert_with(|| {
-                        leopardwm_platform_win32::get_process_executable(info.process_id)
-                    })
-                    .clone()
-                    .and_then(bounded_timeout_diagnostic);
-
-                LayoutApplyTimeoutCandidate {
-                    hwnd,
-                    class_name: bounded_timeout_diagnostic(info.class_name),
-                    title: bounded_timeout_diagnostic(info.title),
-                    executable,
-                }
-            })
-            .collect()
+        collect_layout_apply_candidates(window_ids, |hwnd| self.lookup_window_info(hwnd))
     }
 
     pub(crate) fn resume_deferred_apply_worker_recovery(&mut self) {
@@ -896,7 +903,10 @@ impl AppState {
         }
         // Force timed-out placements past the unchanged-layout fast path.
         self.last_placed_layout_rects.clear();
-        self.apply_layout()?;
+        self.display_change_apply_in_progress = true;
+        let result = self.apply_layout();
+        self.display_change_apply_in_progress = false;
+        result?;
         Ok(())
     }
 
@@ -1010,6 +1020,7 @@ impl AppState {
         std::sync::Arc<std::sync::atomic::AtomicBool>,
     )> {
         let platform_config = self.platform_config.clone();
+        let display_change_apply = self.display_change_apply_in_progress;
         let apply_worker_cancelled = self.apply_worker_cancelled.clone();
         let apply_epoch_ref = self.apply_epoch.clone();
         let apply_epoch = apply_epoch_ref.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1160,19 +1171,47 @@ impl AppState {
                     height_violations,
                     maximized_skipped_window_ids,
                     landings,
-                ) = match leopardwm_platform_win32::apply_placements(
-                    &all_placements,
-                    &platform_config,
-                    None,
-                    post_animation_nudge,
-                ) {
-                    Ok(r) => (
-                        Ok(()),
-                        r.width_violations,
-                        r.height_violations,
-                        r.maximized_skipped_window_ids,
-                        r.landings,
-                    ),
+                ) = match if display_change_apply {
+                    leopardwm_platform_win32::apply_display_change_placements(
+                        &all_placements,
+                        &platform_config,
+                        post_animation_nudge,
+                    )
+                } else {
+                    leopardwm_platform_win32::apply_placements(
+                        &all_placements,
+                        &platform_config,
+                        None,
+                        post_animation_nudge,
+                    )
+                    .map(|result| (result, std::collections::HashSet::new()))
+                } {
+                    Ok((r, unresponsive_window_ids)) => {
+                        if !unresponsive_window_ids.is_empty() {
+                            let candidates = collect_layout_apply_candidates(
+                                &unresponsive_window_ids.iter().copied().collect::<Vec<_>>(),
+                                leopardwm_platform_win32::get_window_info,
+                            );
+                            let windows: Vec<_> = candidates
+                                .iter()
+                                .map(|candidate| format!(
+                                    "hwnd={:#x} class={:?} title={:?} executable={:?}",
+                                    candidate.hwnd, candidate.class_name, candidate.title, candidate.executable
+                                ))
+                                .collect();
+                            warn!(
+                                "Display-change placement queued asynchronously for unresponsive windows: {}",
+                                windows.join("; ")
+                            );
+                        }
+                        (
+                            Ok(()),
+                            r.width_violations,
+                            r.height_violations,
+                            r.maximized_skipped_window_ids,
+                            r.landings,
+                        )
+                    },
                     Err(e) => (
                         Err(anyhow!(e.to_string())),
                         Vec::new(),
