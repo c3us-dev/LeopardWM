@@ -248,6 +248,7 @@ impl Workspace {
             }
         }
         self.clamp_focus_indices();
+        self.sync_active_tab_to_focus();
         Some(col)
     }
 
