@@ -4575,6 +4575,83 @@ mod tests {
     }
 
     #[test]
+    fn test_movement_on_empty_tiled_strip_is_noop() {
+        let empty = Workspace::new();
+        let mut emptied = Workspace::new();
+        emptied.insert_window(1, Some(400)).unwrap();
+        emptied.remove_window(1).unwrap();
+        let mut floating_only = Workspace::new();
+        floating_only
+            .add_floating(2, Rect::new(10, 20, 400, 300))
+            .unwrap();
+
+        type Movement = fn(&mut Workspace);
+        let movements: [(&str, Movement); 12] = [
+            ("column left", Workspace::move_column_left),
+            ("column right", Workspace::move_column_right),
+            ("column start", Workspace::move_column_to_start),
+            ("column end", Workspace::move_column_to_end),
+            ("window left", Workspace::move_window_left),
+            ("window right", Workspace::move_window_right),
+            ("window up", Workspace::move_window_up_in_column),
+            ("window down", Workspace::move_window_down_in_column),
+            ("expel left", Workspace::expel_to_left),
+            ("expel right", Workspace::expel_to_right),
+            ("consume left", Workspace::consume_from_left),
+            ("consume right", Workspace::consume_from_right),
+        ];
+        for (state, workspace) in [
+            ("empty", empty),
+            ("last window removed", emptied),
+            ("floating only", floating_only),
+        ] {
+            assert_eq!(workspace.focused_window(), None);
+            let before = serde_json::to_value(&workspace).unwrap();
+            for (name, movement) in movements {
+                let mut ws = workspace.clone();
+                // Repeated input must also leave membership, geometry and focus unchanged.
+                for _ in 0..2 {
+                    movement(&mut ws);
+                    assert_eq!(
+                        serde_json::to_value(&ws).unwrap(),
+                        before,
+                        "{name} changed {state} workspace"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_vertical_movement_in_tabbed_column_preserves_window_focus() {
+        let mut ws = ws_3_tabs();
+        ws.toggle_focused_column_tabbed_mode();
+        ws.set_active_tab(0, 1).unwrap();
+        let focused = ws.focused_window();
+
+        ws.move_window_down_in_column();
+        assert_eq!(ws.columns()[0].windows(), &[1, 3, 2]);
+        assert_eq!(ws.focused_window(), focused);
+        assert_eq!(ws.focused_window_index_in_column(), 2);
+        assert_eq!(ws.columns()[0].active_tab_idx(), Some(2));
+
+        let bottom = serde_json::to_value(&ws).unwrap();
+        ws.move_window_down_in_column();
+        assert_eq!(serde_json::to_value(&ws).unwrap(), bottom);
+
+        ws.move_window_up_in_column();
+        ws.move_window_up_in_column();
+        assert_eq!(ws.columns()[0].windows(), &[2, 1, 3]);
+        assert_eq!(ws.focused_window(), focused);
+        assert_eq!(ws.focused_window_index_in_column(), 0);
+        assert_eq!(ws.columns()[0].active_tab_idx(), Some(0));
+
+        let top = serde_json::to_value(&ws).unwrap();
+        ws.move_window_up_in_column();
+        assert_eq!(serde_json::to_value(&ws).unwrap(), top);
+    }
+
+    #[test]
     fn test_move_window_preserves_minimized() {
         let mut ws = Workspace::new();
         ws.insert_window(1, Some(400)).unwrap();
